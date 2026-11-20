@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import asyncio
 import threading
@@ -6,7 +7,19 @@ import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from config import N_CTX, N_GPU_LAYERS, REASONING_BUDGET
+from config import (
+    APP_DIR,
+    FFMPEG_DIR,
+    N_CTX,
+    N_GPU_LAYERS,
+    REASONING_BUDGET,
+    MODEL_PRESETS,
+    MODEL_PRESETS_BY_ID,
+    DEFAULT_MODEL_ID,
+)
+
+if FFMPEG_DIR.is_dir():
+    os.environ["PATH"] = str(FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
 from models import load_model, close_model
 from slicing import find_pauses
 from describe import describe_scene
@@ -28,6 +41,10 @@ DEFAULT_SETTINGS = {
     "n_ctx": N_CTX,
     "n_gpu_layers": N_GPU_LAYERS,
     "reasoning_budget": REASONING_BUDGET,
+    "model_id": DEFAULT_MODEL_ID,
+    "custom_repo_id": "",
+    "custom_model_file": "",
+    "custom_mmproj_file": "",
 }
 
 
@@ -39,12 +56,26 @@ def load_settings():
                 s.update(json.load(f))
         except Exception:
             pass
+    if s.get("model_id") not in MODEL_PRESETS_BY_ID:
+        s["model_id"] = DEFAULT_MODEL_ID
     return s
 
 
 def save_settings(s):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
+
+
+def resolve_model(settings):
+    """Возвращает (repo_id, model_file, mmproj_file, display_name) для выбранной модели."""
+    model_id = settings.get("model_id", DEFAULT_MODEL_ID)
+    if model_id == "custom":
+        repo_id = settings.get("custom_repo_id", "").strip()
+        model_file = settings.get("custom_model_file", "").strip()
+        mmproj_file = settings.get("custom_mmproj_file", "").strip() or None
+        return repo_id, model_file, mmproj_file, "Своя модель"
+    preset = MODEL_PRESETS_BY_ID.get(model_id) or MODEL_PRESETS_BY_ID[DEFAULT_MODEL_ID]
+    return preset["repo_id"], preset["model_file"], preset["mmproj_file"], preset["name"]
 
 
 class Stopped(Exception):
@@ -68,11 +99,25 @@ class App:
         self.movie_var = tk.StringVar()
 
         # --- выбор файла ---
-        top = ttk.Frame(root, padding=10)
+        top = ttk.Frame(root, padding=(10, 10, 10, 6))
         top.pack(fill="x")
-        ttk.Label(top, text="Фильм:").pack(side="left")
+        ttk.Label(top, text="Фильм:", width=11).pack(side="left")
         ttk.Entry(top, textvariable=self.movie_var).pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(top, text="Выбрать...", command=self.choose_movie).pack(side="left")
+
+        # --- выбор модели ---
+        model_row = ttk.Frame(root, padding=(10, 0, 10, 8))
+        model_row.pack(fill="x")
+        ttk.Label(model_row, text="Модель ИИ:", width=11).pack(side="left")
+        self.model_var = tk.StringVar(value=MODEL_PRESETS_BY_ID[self.settings["model_id"]]["name"])
+        self.model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.model_var,
+            values=[m["name"] for m in MODEL_PRESETS],
+            state="readonly",
+        )
+        self.model_combo.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
 
         # --- кнопки ---
         btns = ttk.Frame(root, padding=(10, 0))
@@ -110,6 +155,12 @@ class App:
         if path:
             self.movie_var.set(path)
 
+    def on_model_change(self, _event=None):
+        idx = self.model_combo.current()
+        if 0 <= idx < len(MODEL_PRESETS):
+            self.settings["model_id"] = MODEL_PRESETS[idx]["id"]
+            save_settings(self.settings)
+
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Настройки")
@@ -142,6 +193,20 @@ class App:
                         variable=skip_var).grid(row=len(fields), column=0, columnspan=2,
                                                 sticky="w", pady=6)
 
+        custom_frame = ttk.LabelFrame(frm, text="Своя модель (если выбрана «Своя модель»)", padding=8)
+        custom_frame.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        custom_fields = [
+            ("custom_repo_id", "HF репозиторий"),
+            ("custom_model_file", "Файл модели (.gguf)"),
+            ("custom_mmproj_file", "Файл mmproj (.gguf)"),
+        ]
+        custom_vars = {}
+        for crow, (key, label) in enumerate(custom_fields):
+            ttk.Label(custom_frame, text=label).grid(row=crow, column=0, sticky="w", pady=2)
+            v = tk.StringVar(value=str(self.settings.get(key, "")))
+            ttk.Entry(custom_frame, textvariable=v, width=38).grid(row=crow, column=1, padx=(8, 0), pady=2)
+            custom_vars[key] = v
+
         def save():
             try:
                 for key, _, typ in fields:
@@ -150,11 +215,13 @@ class App:
                 messagebox.showerror("Ошибка", "Проверьте значения: где-то введено не число.")
                 return
             self.settings["skip_subs"] = skip_var.get()
+            for key, _ in custom_fields:
+                self.settings[key] = custom_vars[key].get().strip()
             save_settings(self.settings)
             win.destroy()
 
         b = ttk.Frame(frm)
-        b.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(8, 0))
+        b.grid(row=len(fields) + 2, column=0, columnspan=2, pady=(8, 0))
         ttk.Button(b, text="Сохранить", command=save).pack(side="left", padx=5)
         ttk.Button(b, text="Отмена", command=win.destroy).pack(side="left")
 
@@ -178,6 +245,7 @@ class App:
                 elif kind == "done":
                     self.start_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
+                    self.model_combo.configure(state="readonly")
                 elif kind == "error":
                     messagebox.showerror("Ошибка", value)
         except queue.Empty:
@@ -189,10 +257,18 @@ class App:
         if not movie or not os.path.exists(movie):
             messagebox.showwarning("Нет файла", "Сначала выберите фильм.")
             return
+        repo_id, model_file, _, _ = resolve_model(self.settings)
+        if not repo_id or not model_file:
+            messagebox.showwarning(
+                "Нет модели",
+                "Укажите репозиторий и файл модели в Настройках или выберите готовую модель из списка.",
+            )
+            return
         self.stop_event.clear()
         self.progress["value"] = 0
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.model_combo.configure(state="disabled")
         self.worker = threading.Thread(target=self.run_pipeline, args=(movie, dict(self.settings)),
                                        daemon=True)
         self.worker.start()
@@ -222,13 +298,19 @@ class App:
             os.makedirs("voices", exist_ok=True)
             os.makedirs("result", exist_ok=True)
 
+            repo_id, model_file, mmproj_file, model_name = resolve_model(s)
+
             def loader():
                 self.check_stop()
+                self.post("log", f"Загружаю модель: {model_name} ({repo_id} / {model_file})...")
                 llm = load_model(
                     n_ctx=s["n_ctx"],
                     n_gpu_layers=s["n_gpu_layers"],
                     reasoning_budget=s["reasoning_budget"],
                     stop_event=self.stop_event,
+                    repo_id=repo_id,
+                    model_file=model_file,
+                    mmproj_file=mmproj_file,
                 )
                 self.active_llm = llm
                 return llm
@@ -305,6 +387,8 @@ class App:
 
 
 if __name__ == "__main__":
+    if getattr(sys, "frozen", False):
+        os.chdir(APP_DIR)
     root = tk.Tk()
     App(root)
     root.mainloop()

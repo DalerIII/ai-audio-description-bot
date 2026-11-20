@@ -12,6 +12,7 @@ result/
 subtitles/
 voices/
 work/
+dist/
 
 mix.flac
 orig.raw

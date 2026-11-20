@@ -1,8 +1,9 @@
-import gc, json, re, shutil, subprocess, sys
+import gc, json, re, shutil, subprocess
 from pathlib import Path
 
 import torch
 import whisperx
+from demucs.separate import main as demucs_main
 
 from models import chat, close_model
 
@@ -56,8 +57,8 @@ def extract_vocals(video, workdir, chunk_sec=600):
                     str(chunks / "c_%03d.wav")], check=True)
     files = sorted(chunks.glob("c_*.wav"))
 
-    subprocess.run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", str(workdir),
-                    *map(str, files)], check=True)            
+    demucs_main(["--two-stems=vocals", "-o", str(workdir), *map(str, files)])
+    free()
 
     vocal_files = [(workdir / "htdemucs" / f.stem / "vocals.wav").resolve().as_posix() for f in files]
     lst = workdir / "list.txt"

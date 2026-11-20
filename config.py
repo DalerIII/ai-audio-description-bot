@@ -1,4 +1,8 @@
+import sys
 from pathlib import Path
+
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+FFMPEG_DIR = APP_DIR / "bin" / "ffmpeg"
 
 # ---- ваши существующие значения (подставьте свои) ----
 N_CTX = 8192
@@ -9,13 +13,68 @@ MAX_REPLY = max(1500, RESERVED_TOKENS // 10)
 TOKENS_PER_WORD = 3        # запас для русского текста
 
 # ---- настройки загрузки модели (значения-заглушки, подставьте свои) ----
-LLAMA_SERVER_DIR = ""  # путь к папке с llama-server.exe
+LLAMA_SERVER_DIR = APP_DIR / "bin" / "llama"  # папка с llama-server.exe
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
 
-REPO_ID = "prism-ml/Ternary-Bonsai-2-27B-gguf"
-MODEL_FILE = "Ternary-Bonsai-2-27B-PTQ1_0.gguf"
-MMPROJ_FILE = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"  # или mmproj-Q8_0, если есть во вкладке Files на HF
+MODEL_PRESETS = [
+    {
+        "id": "qwen35-9b",
+        "name": "Qwen 3.5 9B (Q4_K_M, ~6.5 ГБ) — рекомендуемая",
+        "repo_id": "unsloth/Qwen3.5-9B-GGUF",
+        "model_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "qwen35-4b",
+        "name": "Qwen 3.5 4B (Q4_K_M, ~3.5 ГБ) — лёгкая и быстрая",
+        "repo_id": "unsloth/Qwen3.5-4B-GGUF",
+        "model_file": "Qwen3.5-4B-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "qwen3-vl-8b",
+        "name": "Qwen3-VL 8B Instruct (Q4_K_M, ~6.2 ГБ)",
+        "repo_id": "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        "model_file": "Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "qwen25-vl-7b",
+        "name": "Qwen2.5-VL 7B Instruct (Q4_K_M, ~5.5 ГБ) — классика",
+        "repo_id": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+        "model_file": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "gemma4-e4b",
+        "name": "Gemma 4 E4B (Q4_K_M, ~5.5 ГБ) — Google",
+        "repo_id": "unsloth/gemma-4-E4B-it-GGUF",
+        "model_file": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "gemma3-4b",
+        "name": "Gemma 3 4B (Q4_K_M, ~3.3 ГБ) — ультралёгкая",
+        "repo_id": "unsloth/gemma-3-4b-it-GGUF",
+        "model_file": "gemma-3-4b-it-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-F16.gguf",
+    },
+    {
+        "id": "custom",
+        "name": "Своя модель (Hugging Face — из настроек)",
+        "repo_id": "",
+        "model_file": "",
+        "mmproj_file": "",
+    },
+]
+
+MODEL_PRESETS_BY_ID = {m["id"]: m for m in MODEL_PRESETS}
+DEFAULT_MODEL_ID = "qwen35-9b"
+
+REPO_ID = MODEL_PRESETS_BY_ID[DEFAULT_MODEL_ID]["repo_id"]
+MODEL_FILE = MODEL_PRESETS_BY_ID[DEFAULT_MODEL_ID]["model_file"]
+MMPROJ_FILE = MODEL_PRESETS_BY_ID[DEFAULT_MODEL_ID]["mmproj_file"]
 
 N_GPU_LAYERS = 99          # -1 - все слои на GPU, 0 - только CPU
 N_THREADS = 6              # потоков CPU

@@ -38,17 +38,24 @@ def load_model(
     n_gpu_layers: int = N_GPU_LAYERS,
     reasoning_budget: int = REASONING_BUDGET,
     stop_event=None,
+    repo_id: str = REPO_ID,
+    model_file: str = MODEL_FILE,
+    mmproj_file: str | None = MMPROJ_FILE,
 ) -> dict:
     if not LLAMA_SERVER_DIR:
         raise ValueError("Не указан путь LLAMA_SERVER_DIR в config.py (папка с llama-server.exe)")
+    if not repo_id or not model_file:
+        raise ValueError("Не указаны репозиторий и файл модели.")
     server_dir = Path(LLAMA_SERVER_DIR)
     server_exe = server_dir / "llama-server.exe"
     if not server_exe.exists():
         raise FileNotFoundError(f"Не найден llama-server.exe по пути: {server_exe}")
 
-    model_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILE)
-    mmproj_path = hf_hub_download(repo_id=REPO_ID, filename=MMPROJ_FILE) if MMPROJ_FILE else None
+    model_path = hf_hub_download(repo_id=repo_id, filename=model_file)
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Остановлено пользователем")
 
+    mmproj_path = hf_hub_download(repo_id=repo_id, filename=mmproj_file) if mmproj_file else None
     if stop_event is not None and stop_event.is_set():
         raise InterruptedError("Остановлено пользователем")
 
@@ -93,7 +100,7 @@ def load_model(
         except requests.RequestException:
             pass
         time.sleep(1.0)
-    return {"proc": proc, "url": server_url, "session": session}
+    return {"proc": proc, "url": server_url, "session": session, "model_file": model_file}
 
 
 def close_model(llm) -> None:
@@ -118,7 +125,7 @@ _SPEED_LOG = []
 _SPEED_FILE = Path("speed_stats.csv")
 
 
-def _record_speed(data: dict, elapsed: float) -> None:
+def _record_speed(data: dict, elapsed: float, model_file: str = MODEL_FILE) -> None:
     timings = data.get("timings") or {}
     usage = data.get("usage") or {}
     prompt_n = timings.get("prompt_n") or usage.get("prompt_tokens") or 0
@@ -131,7 +138,7 @@ def _record_speed(data: dict, elapsed: float) -> None:
     with _SPEED_FILE.open("a", encoding="utf-8") as f:
         if write_header:
             f.write("model,prompt_tokens,prompt_tps,gen_tokens,gen_tps,elapsed_sec\n")
-        f.write(f"{MODEL_FILE},{prompt_n},{prompt_tps:.2f},{gen_n},{gen_tps:.2f},{elapsed:.2f}\n")
+        f.write(f"{model_file},{prompt_n},{prompt_tps:.2f},{gen_n},{gen_tps:.2f},{elapsed:.2f}\n")
 
     print(f"[speed] prompt: {prompt_n} tok ({prompt_tps:.1f} t/s) | gen: {gen_n} tok ({gen_tps:.1f} t/s) | {elapsed:.2f}s")
 
@@ -162,7 +169,7 @@ def chat(llm: dict, messages: list, max_tokens: int = MAX_REPLY, temperature: fl
     )
     r.raise_for_status()
     data = r.json()
-    _record_speed(data, time.perf_counter() - t0)  # [SPEED STATS]
+    _record_speed(data, time.perf_counter() - t0, llm.get("model_file", MODEL_FILE))  # [SPEED STATS]
     # Извлекаем текст ответа и вырезаем возможные блоки рассуждений <think>...</think>
     text = data["choices"][0]["message"]["content"] or ""
     return _THINK_RE.sub("", text).strip()
