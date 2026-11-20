@@ -13,6 +13,7 @@ subtitles/
 voices/
 work/
 dist/
+build/
 
 mix.flac
 orig.raw
