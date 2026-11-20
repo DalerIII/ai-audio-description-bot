@@ -19,3 +19,4 @@ mix.flac
 orig.raw
 speed_stats.csv
 settings.json
+*.spec
