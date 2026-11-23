@@ -1,5 +1,8 @@
+import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -7,6 +10,7 @@ import requests
 from huggingface_hub import hf_hub_download
 
 from config import (
+    APP_DIR,
     LLAMA_SERVER_DIR, SERVER_HOST, SERVER_PORT,
     REPO_ID, MODEL_FILE, MMPROJ_FILE,
     N_CTX, N_GPU_LAYERS, N_THREADS, FLASH_ATTN,
@@ -15,6 +19,51 @@ from config import (
 )
 
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", flags=re.DOTALL)
+_NEW_PROMPT_RE = re.compile(r"new prompt.*task\.n_tokens\s*=\s*(\d+)")
+_PROMPT_PROGRESS_RE = re.compile(
+    r"prompt processing,\s*n_tokens\s*=\s*(\d+),\s*progress\s*=\s*[0-9.]+,\s*t\s*=\s*[0-9.]+\s*s\s*/\s*([0-9.]+)\s*tokens per second"
+)
+
+
+def _watch_server_output(proc: subprocess.Popen, on_stats=None) -> None:
+    log_file = None
+    frozen = getattr(sys, "frozen", False)
+    if frozen:
+        try:
+            log_file = open(APP_DIR / "llama_server.log", "a", encoding="utf-8", errors="replace", buffering=1)
+        except OSError:
+            log_file = None
+
+    current_prompt_total = None
+    try:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            if log_file is not None:
+                log_file.write(line)
+            elif not frozen and sys.stdout is not None:
+                sys.stdout.write(line)
+
+            m_new = _NEW_PROMPT_RE.search(line)
+            if m_new:
+                current_prompt_total = int(m_new.group(1))
+                if on_stats is not None:
+                    on_stats(f"Модель: чтение 0/{current_prompt_total} ток...")
+                continue
+
+            m_prog = _PROMPT_PROGRESS_RE.search(line)
+            if m_prog and on_stats is not None:
+                done = int(m_prog.group(1))
+                tps = float(m_prog.group(2))
+                if current_prompt_total:
+                    on_stats(f"Модель: чтение {done}/{current_prompt_total} ток ({tps:.1f} ток/с)")
+                else:
+                    on_stats(f"Модель: чтение {done} ток ({tps:.1f} ток/с)")
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if log_file is not None:
+            log_file.close()
 
 
 # === [EXTRA SERVER ARGS — "чёрный ящик", управляется через USE_EXTRA_SERVER_ARGS в config.py] ===
@@ -41,6 +90,7 @@ def load_model(
     repo_id: str = REPO_ID,
     model_file: str = MODEL_FILE,
     mmproj_file: str | None = MMPROJ_FILE,
+    on_stats=None,
 ) -> dict:
     if not LLAMA_SERVER_DIR:
         raise ValueError("Не указан путь LLAMA_SERVER_DIR в config.py (папка с llama-server.exe)")
@@ -83,7 +133,20 @@ def load_model(
     cmd += _extra_server_args()
 
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
-    proc = subprocess.Popen(cmd, cwd=str(server_dir))
+    popen_kwargs = {
+        "cwd": str(server_dir),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    threading.Thread(target=_watch_server_output, args=(proc, on_stats), daemon=True).start()
     session = requests.Session()
     session.trust_env = False
     while True:
@@ -100,7 +163,7 @@ def load_model(
         except requests.RequestException:
             pass
         time.sleep(1.0)
-    return {"proc": proc, "url": server_url, "session": session, "model_file": model_file}
+    return {"proc": proc, "url": server_url, "session": session, "model_file": model_file, "on_stats": on_stats}
 
 
 def close_model(llm) -> None:
@@ -125,7 +188,7 @@ _SPEED_LOG = []
 _SPEED_FILE = Path("speed_stats.csv")
 
 
-def _record_speed(data: dict, elapsed: float, model_file: str = MODEL_FILE) -> None:
+def _record_speed(data: dict, elapsed: float, model_file: str = MODEL_FILE, on_stats=None) -> None:
     timings = data.get("timings") or {}
     usage = data.get("usage") or {}
     prompt_n = timings.get("prompt_n") or usage.get("prompt_tokens") or 0
@@ -139,6 +202,12 @@ def _record_speed(data: dict, elapsed: float, model_file: str = MODEL_FILE) -> N
         if write_header:
             f.write("model,prompt_tokens,prompt_tps,gen_tokens,gen_tps,elapsed_sec\n")
         f.write(f"{model_file},{prompt_n},{prompt_tps:.2f},{gen_n},{gen_tps:.2f},{elapsed:.2f}\n")
+
+    if on_stats is not None:
+        on_stats(
+            f"Модель: чтение {prompt_n} ток ({prompt_tps:.1f} ток/с) • "
+            f"генерация {gen_n} ток ({gen_tps:.1f} ток/с)"
+        )
 
     print(f"[speed] prompt: {prompt_n} tok ({prompt_tps:.1f} t/s) | gen: {gen_n} tok ({gen_tps:.1f} t/s) | {elapsed:.2f}s")
 
@@ -158,21 +227,30 @@ def _print_speed_summary() -> None:
 
 def chat(llm: dict, messages: list, max_tokens: int = MAX_REPLY, temperature: float = 0.3) -> str:
     # Отправляем OpenAI-совместимый запрос на генерацию ответа в /v1/chat/completions
-    t0 = time.perf_counter()  # [SPEED STATS]
-    r = llm["session"].post(
-        f"{llm['url']}/v1/chat/completions",
-        json={
+    for extra in (None, {"chat_template_kwargs": {"enable_thinking": False}}):
+        payload = {
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-        },
-    )
-    r.raise_for_status()
-    data = r.json()
-    _record_speed(data, time.perf_counter() - t0, llm.get("model_file", MODEL_FILE))  # [SPEED STATS]
-    # Извлекаем текст ответа и вырезаем возможные блоки рассуждений <think>...</think>
-    text = data["choices"][0]["message"]["content"] or ""
-    return _THINK_RE.sub("", text).strip()
+        }
+        if extra:
+            payload.update(extra)
+        t0 = time.perf_counter()  # [SPEED STATS]
+        r = llm["session"].post(f"{llm['url']}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        _record_speed(
+            data,
+            time.perf_counter() - t0,
+            llm.get("model_file", MODEL_FILE),
+            on_stats=llm.get("on_stats"),
+        )  # [SPEED STATS]
+        # Извлекаем текст ответа и вырезаем возможные блоки рассуждений <think>...</think>
+        text = data["choices"][0]["message"].get("content") or ""
+        cleaned = _THINK_RE.sub("", text).strip()
+        if cleaned:
+            return cleaned
+    return ""
 
 
 def count_tokens(llm: dict, text: str) -> int:

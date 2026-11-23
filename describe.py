@@ -183,7 +183,7 @@ def frame_message(n, start, shift):
     ]}
 
 
-def image_comment(llm, ctx_text, start, shift):
+def image_comment(llm, ctx_text, start, shift, on_progress=None):
     messages = [
         {"role": "system", "content": f"{PLOT_CONTEXT_TEMPLATE}\n\n{format_ctx(ctx_text)}"},
     ]
@@ -205,7 +205,12 @@ def image_comment(llm, ctx_text, start, shift):
         for n in range(1, total_frames + 1):
             messages.append(frame_message(n, start, shift))
 
-        return chat(llm, messages, max_tokens=MAX_REPLY, temperature=0.3)
+        if on_progress is not None:
+            on_progress(0.0, f"анализ кадров ({total_frames} шт.)...")
+        res = chat(llm, messages, max_tokens=MAX_REPLY, temperature=0.3)
+        if on_progress is not None:
+            on_progress(1.0, "кадры описаны")
+        return res
 
     # нужно несколько проходов: резервируем место под описание предыдущего батча ([ctx])
     image_per_batch = floor((available - MAX_REPLY) / tokens_per_image)
@@ -214,9 +219,12 @@ def image_comment(llm, ctx_text, start, shift):
 
     scene_log = []
     base = list(messages)
+    total_batches = (total_frames + image_per_batch - 1) // image_per_batch
 
-    for first in range(1, total_frames + 1, image_per_batch):
+    for batch_idx, first in enumerate(range(1, total_frames + 1, image_per_batch), start=1):
         last = min(first + image_per_batch - 1, total_frames)
+        if on_progress is not None:
+            on_progress((batch_idx - 1) / total_batches, f"анализ кадров (батч {batch_idx}/{total_batches})...")
 
         messages = list(base)
         if scene_log:
@@ -228,6 +236,8 @@ def image_comment(llm, ctx_text, start, shift):
 
         temp_summary = chat(llm, messages, max_tokens=MAX_REPLY, temperature=0.3)
         scene_log.append(temp_summary)
+        if on_progress is not None:
+            on_progress(batch_idx / total_batches, f"анализ кадров (батч {batch_idx}/{total_batches})")
 
     return scene_log
 
@@ -245,14 +255,28 @@ def summarizer(llm, scene_log, max_words, ctx_text):
 
 # ------------------------------------------- полный проход по одной паузе
 def describe_scene(llm, plot_path, subtitles_path, video_path, period,
-                   pause_index, shift, max_words, context=None):
+                   pause_index, shift, max_words, context=None, on_progress=None):
+    def emit(frac, text):
+        if on_progress is not None:
+            on_progress(frac, text)
+
     entries = parse_plot(plot_path)
+    emit(0.0, "вырезаю кадры...")
     start, end = slice(pause_index, shift, subtitles_path, period, video_path)
 
+    emit(0.15, "собираю контекст сцены...")
     ctx_text, context = build_scene_context(
         llm, entries, subtitles_path, start, end, context)
 
-    scene_log = image_comment(llm, ctx_text, start, shift)
+    scene_log = image_comment(
+        llm,
+        ctx_text,
+        start,
+        shift,
+        on_progress=(lambda f, t: emit(0.25 + 0.55 * f, t)) if on_progress is not None else None,
+    )
+    emit(0.80, "итоговый пересказ сцены...")
     summary = summarizer(llm, scene_log, max_words, ctx_text)
+    emit(1.0, "описание сцены готово")
 
     return summary, context

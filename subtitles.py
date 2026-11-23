@@ -1,10 +1,18 @@
-import gc, json, re, shutil, subprocess
+import gc, json, os, re, subprocess, sys, tempfile, time, wave
 from pathlib import Path
 
-import torch
-import whisperx
-from demucs.separate import main as demucs_main
+import numpy as np
+from huggingface_hub import hf_hub_download
 
+from config import (
+    APP_DIR,
+    N_THREADS,
+    WHISPER_DIR,
+    WHISPER_REPO_ID,
+    WHISPER_MODEL_FILE,
+    WHISPER_VAD_REPO_ID,
+    WHISPER_VAD_MODEL_FILE,
+)
 from models import chat, close_model
 
 SR = 16000             
@@ -20,7 +28,6 @@ FAR_WORDS = 300
 
 def free():
     gc.collect()
-    torch.cuda.empty_cache()
 
 
 def extract_audio(input_video, output_audio, track=0, sample_rate=16000, mono=True):
@@ -31,7 +38,13 @@ def extract_audio(input_video, output_audio, track=0, sample_rate=16000, mono=Tr
         cmd += ["-ac", "1"]
     cmd.append(output_audio)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if (os.name == "nt" and getattr(sys, "frozen", False)) else 0,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Ошибка ffmpeg:\n{result.stderr}")
     print(f"Аудио сохранено в {output_audio}")
@@ -44,61 +57,384 @@ def ts(t):
     s, ms = divmod(rem, 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-def extract_vocals(video, workdir, chunk_sec=600):
-    final = workdir / "vocals_16k.wav"
-    if final.exists():                                        
-        return str(final)
 
-    chunks = workdir / "chunks"
-    shutil.rmtree(chunks, ignore_errors=True)                 
-    chunks.mkdir()
-    subprocess.run(["ffmpeg", "-y", "-i", video, "-vn", "-ac", "2", "-ar", "44100",
-                    "-f", "segment", "-segment_time", str(chunk_sec), "-c:a", "pcm_s16le",
-                    str(chunks / "c_%03d.wav")], check=True)
-    files = sorted(chunks.glob("c_*.wav"))
-
-    demucs_main(["--two-stems=vocals", "-o", str(workdir), *map(str, files)])
-    free()
-
-    vocal_files = [(workdir / "htdemucs" / f.stem / "vocals.wav").resolve().as_posix() for f in files]
-    lst = workdir / "list.txt"
-    lst.write_text("".join(f"file '{v}'\n" for v in vocal_files), encoding="utf-8")
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-                    "-ac", "1", "-ar", "16000", str(final)], check=True)
-    return str(final)
-
-def detect_language(model, audio, detect_sec):
-    start = max(0, (len(audio) / SR - detect_sec) / 2)       
-    chunk = audio[int(start * SR):int((start + detect_sec) * SR)]
-    lang, prob, _ = model.model.detect_language(chunk, vad_filter=True,  
-                                                language_detection_segments=max(1, int(detect_sec // 30)))
-    print(f"Язык: {lang} ({prob:.2f}), кусок {start:.0f}-{start + detect_sec:.0f} с")
-    return lang
-
-def transcribe(audio, device, model_name, language, batch_size, detect_sec):
-    compute_type = "float16" if device == "cuda" else "int8"
-    model = whisperx.load_model(model_name, device, compute_type=compute_type, vad_method="silero")
-    if language is None:
-        language = detect_language(model, audio, detect_sec)
-    result = model.transcribe(audio, batch_size=batch_size, language=language)
-    del model; free()
-
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-    del model_a; free()
-
-    return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
+_VAD_SEG_RE = re.compile(
+    r"Speech segment\s+\d+:\s*start\s*=\s*([0-9.]+)\s*,\s*end\s*=\s*([0-9.]+)"
+)
+_LANG_RE = re.compile(r"auto-detected language:\s*([a-zA-Z-]+)")
 
 
-def get_segments(input_video, workdir, device, model_name, language, batch_size, detect_sec):
+def _find_whisper_bin(filename: str) -> Path:
+    if not WHISPER_DIR:
+        raise ValueError(f"Не указан путь WHISPER_DIR в config.py (папка с {filename})")
+    exe = Path(WHISPER_DIR) / filename
+    if not exe.exists():
+        raise FileNotFoundError(f"Не найден {filename} по пути: {exe}")
+    return exe
+
+
+def _run_subprocess(
+    cmd: list[str],
+    cwd: Path,
+    log_name: str,
+    stop_event=None,
+    capture_output: bool = False,
+) -> str:
+    popen_kwargs = {"cwd": str(cwd)}
+    log_handle = None
+    out_file = None
+
+    if capture_output:
+        out_file = tempfile.TemporaryFile(mode="w+b")
+        popen_kwargs.update({
+            "stdin": subprocess.DEVNULL,
+            "stdout": out_file,
+            "stderr": subprocess.STDOUT,
+        })
+    elif getattr(sys, "frozen", False):
+        try:
+            log_handle = open(APP_DIR / log_name, "a", encoding="utf-8", errors="replace")
+        except OSError:
+            log_handle = subprocess.DEVNULL
+        popen_kwargs.update({
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+        })
+
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    finally:
+        if log_handle is not None and log_handle is not subprocess.DEVNULL:
+            log_handle.close()
+
+    try:
+        while proc.poll() is None:
+            if stop_event is not None and stop_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                raise InterruptedError("Остановлено пользователем")
+            time.sleep(0.5)
+
+        stdout_text = ""
+        if out_file is not None:
+            out_file.seek(0)
+            stdout_text = out_file.read().decode("utf-8", errors="replace")
+    finally:
+        if out_file is not None:
+            out_file.close()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"{Path(cmd[0]).name} завершился с кодом {proc.returncode}")
+
+    return stdout_text
+
+
+def _parse_vad_segments(output_text: str) -> list[tuple[float, float]]:
+    # whisper-vad-speech-segments печатает границы в сотых долях секунды (centiseconds)
+    intervals = []
+    for m in _VAD_SEG_RE.finditer(output_text):
+        start = float(m.group(1)) / 100.0
+        end = float(m.group(2)) / 100.0
+        if end > start:
+            intervals.append((start, end))
+    return intervals
+
+
+def _detect_speech_intervals(
+    audio_path: Path, vad_model_path: str, stop_event=None
+) -> list[tuple[float, float]]:
+    vad_exe = _find_whisper_bin("whisper-vad-speech-segments.exe")
+    cmd = [
+        str(vad_exe),
+        "-vm", vad_model_path,
+        "-f", str(Path(audio_path).resolve()),
+        "-t", str(N_THREADS),
+    ]
+    out = _run_subprocess(
+        cmd,
+        cwd=vad_exe.parent,
+        log_name="whisper.log",
+        stop_event=stop_event,
+        capture_output=True,
+    )
+    return _parse_vad_segments(out)
+
+
+def _mute_non_speech(
+    src_wav: Path,
+    dst_wav: Path,
+    intervals: list[tuple[float, float]],
+    pad_sec: float = 0.2,
+) -> None:
+    with wave.open(str(src_wav), "rb") as wf:
+        params = wf.getparams()
+        if params.sampwidth != 2:
+            raise ValueError(f"Ожидался 16-bit PCM WAV, получено {params.sampwidth * 8}-bit")
+        raw = wf.readframes(params.nframes)
+
+    samples = np.frombuffer(raw, dtype=np.int16)
+    if params.nchannels > 1:
+        samples = samples.reshape(-1, params.nchannels)
+    out = np.zeros_like(samples)
+
+    total = len(samples)
+    sr = params.framerate
+    for start_sec, end_sec in intervals:
+        i = max(0, int((start_sec - pad_sec) * sr))
+        j = min(total, int((end_sec + pad_sec) * sr))
+        if j > i:
+            out[i:j] = samples[i:j]
+
+    with wave.open(str(dst_wav), "wb") as wf:
+        wf.setparams(params)
+        wf.writeframes(out.tobytes())
+
+
+def _clamp_segments_to_vad(
+    segments: list[dict],
+    vad_intervals: list[tuple[float, float]],
+    pad_sec: float = 0.25,
+) -> list[dict]:
+    clamped = []
+    for seg in segments:
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        overlapping = [
+            (vs, ve) for vs, ve in vad_intervals
+            if ve > seg_start and vs < seg_end
+        ]
+        if not overlapping:
+            continue
+        start = max(seg_start, overlapping[0][0] - pad_sec)
+        end = min(seg_end, overlapping[-1][1] + pad_sec)
+        if end > start:
+            clamped.append({
+                "start": start,
+                "end": end,
+                "text": seg["text"],
+            })
+    return clamped
+
+
+def _parse_whisper_json(json_path: Path) -> list[dict]:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    segments = []
+    for item in data.get("transcription", []):
+        text = (item.get("text") or "").strip()
+        if not text or text == "[BLANK_AUDIO]":
+            continue
+        offsets = item["offsets"]
+        segments.append({
+            "start": offsets["from"] / 1000.0,
+            "end": offsets["to"] / 1000.0,
+            "text": text,
+        })
+    return segments
+
+
+def _write_speech_sample(
+    src_wav: Path,
+    dst_wav: Path,
+    intervals: list[tuple[float, float]],
+    target_sec: float = 30.0,
+) -> bool:
+    if not intervals:
+        return False
+
+    mid = len(intervals) // 2
+    ordered = intervals[mid:] + intervals[:mid]
+
+    chunks = []
+    collected = 0
+    with wave.open(str(src_wav), "rb") as wf:
+        params = wf.getparams()
+        sr = params.framerate
+        total = params.nframes
+        target_frames = int(target_sec * sr)
+
+        for start_sec, end_sec in ordered:
+            if collected >= target_frames:
+                break
+            i = max(0, int(start_sec * sr))
+            j = min(total, int(end_sec * sr))
+            if j <= i:
+                continue
+            take = min(j - i, target_frames - collected)
+            wf.setpos(i)
+            chunks.append(wf.readframes(take))
+            collected += take
+
+    if collected < sr:
+        return False
+
+    with wave.open(str(dst_wav), "wb") as wf:
+        wf.setparams(params)
+        wf.writeframes(b"".join(chunks))
+    return True
+
+
+def _detect_language(
+    whisper_exe: Path,
+    model_path: str,
+    src_wav: Path,
+    vad_intervals: list[tuple[float, float]] | None,
+    workdir: Path,
+    stop_event=None,
+) -> str:
+    if not vad_intervals:
+        return "auto"
+
+    lang_wav = (workdir / "detect_lang.wav").resolve()
+    try:
+        if not _write_speech_sample(src_wav, lang_wav, vad_intervals):
+            return "auto"
+        cmd = [
+            str(whisper_exe),
+            "-m", model_path,
+            "-f", str(lang_wav),
+            "-l", "auto",
+            "-dl",
+            "-t", str(N_THREADS),
+        ]
+        out = _run_subprocess(
+            cmd,
+            cwd=whisper_exe.parent,
+            log_name="whisper.log",
+            stop_event=stop_event,
+            capture_output=True,
+        )
+    finally:
+        lang_wav.unlink(missing_ok=True)
+
+    m = _LANG_RE.search(out)
+    if m:
+        lang = m.group(1)
+        print(f"Определён язык: {lang}")
+        return lang
+    return "auto"
+
+
+def _emit(on_progress, stage_frac: float, step_frac: float | None, text: str) -> None:
+    if on_progress is not None:
+        on_progress(stage_frac, step_frac, text)
+
+
+def _check_stop(stop_event) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Остановлено пользователем")
+
+
+def transcribe(
+    audio_path,
+    workdir,
+    model_file=WHISPER_MODEL_FILE,
+    vad_model_file=WHISPER_VAD_MODEL_FILE,
+    language=None,
+    stop_event=None,
+    on_progress=None,
+) -> list[dict]:
+    whisper_exe = _find_whisper_bin("whisper-cli.exe")
+
+    _check_stop(stop_event)
+    _emit(on_progress, 0.15, None, "Субтитры: проверка моделей Whisper...")
+    model_path = hf_hub_download(repo_id=WHISPER_REPO_ID, filename=model_file)
+    _check_stop(stop_event)
+    vad_path = (
+        hf_hub_download(repo_id=WHISPER_VAD_REPO_ID, filename=vad_model_file)
+        if vad_model_file
+        else None
+    )
+    _check_stop(stop_event)
+
+    src_wav = Path(audio_path).resolve()
+    vad_intervals = None
+    vad_wav = None
+    target_wav = src_wav
+
+    if vad_path:
+        _emit(on_progress, 0.25, None, "Субтитры: поиск речи (VAD)...")
+        vad_intervals = _detect_speech_intervals(src_wav, vad_path, stop_event=stop_event)
+        if not vad_intervals:
+            return []
+        if language is None:
+            _emit(on_progress, 0.40, None, "Субтитры: определение языка...")
+            language = _detect_language(
+                whisper_exe,
+                model_path,
+                src_wav,
+                vad_intervals,
+                Path(workdir),
+                stop_event=stop_event,
+            )
+        _emit(on_progress, 0.48, None, "Субтитры: подготовка аудио...")
+        vad_wav = (Path(workdir) / "audio_16k_vad.wav").resolve()
+        _mute_non_speech(src_wav, vad_wav, vad_intervals)
+        target_wav = vad_wav
+
+    out_prefix = Path(workdir) / "whisper_out"
+    cmd = [
+        str(whisper_exe),
+        "-m", model_path,
+        "-f", str(target_wav),
+        "-l", language or "auto",
+        "-mc", "0",
+        "-sns",
+        "-oj",
+        "-of", str(out_prefix.resolve()),
+        "-t", str(N_THREADS),
+    ]
+    _emit(on_progress, 0.55, None, "Субтитры: распознавание речи (Whisper)...")
+    try:
+        _run_subprocess(cmd, cwd=whisper_exe.parent, log_name="whisper.log", stop_event=stop_event)
+    finally:
+        if vad_wav is not None:
+            vad_wav.unlink(missing_ok=True)
+
+    segments = _parse_whisper_json(Path(f"{out_prefix}.json"))
+    _emit(on_progress, 0.95, 0.95, "Субтитры: обработка сегментов...")
+    if vad_intervals is not None:
+        segments = _clamp_segments_to_vad(segments, vad_intervals)
+    return segments
+
+
+def get_segments(
+    input_video,
+    workdir,
+    model_file=WHISPER_MODEL_FILE,
+    vad_model_file=WHISPER_VAD_MODEL_FILE,
+    language=None,
+    stop_event=None,
+    on_progress=None,
+):
     cache = workdir / "segments.json"
     if cache.exists():
+        _emit(on_progress, 1.0, 1.0, "Субтитры загружены из кэша")
         return json.loads(cache.read_text(encoding="utf-8"))
 
-    vocals = extract_vocals(input_video, workdir)
-    audio = whisperx.load_audio(vocals)                      
-    segments = transcribe(audio, device, model_name, language, batch_size, detect_sec)
+    wav_path = workdir / "audio_16k.wav"
+    if not wav_path.exists():
+        _emit(on_progress, 0.05, None, "Субтитры: извлечение аудио (ffmpeg)...")
+        extract_audio(input_video, str(wav_path))
+
+    segments = transcribe(
+        wav_path,
+        workdir,
+        model_file=model_file,
+        vad_model_file=vad_model_file,
+        language=language,
+        stop_event=stop_event,
+        on_progress=on_progress,
+    )
     cache.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+    _emit(on_progress, 1.0, 1.0, "Субтитры готовы")
     return segments
 
 
@@ -263,7 +599,7 @@ def remember(llm, far, recent, note, language, backward):
 # Проходы 1-2: вперёд (что было) и назад (что будет)
 # ---------------------------------------------------------------------------
 
-def read_pass(llm, segments, chunks, language, backward):
+def read_pass(llm, segments, chunks, language, backward, on_progress=None, stop_event=None):
     """Один проход по фильму целиком.
 
     Возвращает для каждого куска память с той стороны, откуда мы к нему пришли:
@@ -272,12 +608,16 @@ def read_pass(llm, segments, chunks, language, backward):
     order = range(len(chunks) - 1, -1, -1) if backward else range(len(chunks))
     side = "AFTER" if backward else "BEFORE"
     empty = NO_FUTURE if backward else NO_PAST
+    total = len(chunks)
 
     far, recent, known = "", [], {}
     for step, i in enumerate(order, 1):
+        _check_stop(stop_event)
         memory = context_text(far, recent, backward)
         known[i] = memory                                     # что мы знали, когда дошли до этого куска
-        print(f"{'Назад' if backward else 'Вперёд'}: кусок {step}/{len(chunks)}")
+        print(f"{'Назад' if backward else 'Вперёд'}: кусок {step}/{total}")
+        if on_progress is not None:
+            on_progress((step - 1) / total, step, total)
         a, b = chunks[i]
         note = ask(
             llm, PASS_SYSTEM.format(side=side, language=language),
@@ -286,6 +626,8 @@ def read_pass(llm, segments, chunks, language, backward):
             f"Describe in {NOTE_SENTENCES} sentences what happens in the current part.",
             max_tokens=600)
         far = remember(llm, far, recent, note, language, backward)
+        if on_progress is not None:
+            on_progress(step / total, step, total)
     return known
 
 
@@ -293,10 +635,15 @@ def read_pass(llm, segments, chunks, language, backward):
 # Проход 3: события с точными границами. Проход 4: проверка и правка
 # ---------------------------------------------------------------------------
 
-def write_events(llm, segments, chunks, before, after, language):
+def write_events(llm, segments, chunks, before, after, language, on_progress=None, stop_event=None):
     drafts = []
+    total = len(chunks)
     for i, (a, b) in enumerate(chunks):
-        print(f"События: кусок {i + 1}/{len(chunks)}")
+        _check_stop(stop_event)
+        step = i + 1
+        print(f"События: кусок {step}/{total}")
+        if on_progress is not None:
+            on_progress(i / total, step, total)
         answer = ask(
             llm, FINAL_SYSTEM.format(language=language, sentences=EVENT_SENTENCES, count=EVENT_COUNT),
             f"Summary of the film BEFORE this part:\n{before[i] or NO_PAST}\n\n"
@@ -306,14 +653,21 @@ def write_events(llm, segments, chunks, before, after, language):
             "Split the current part into events.",
             max_tokens=1500)
         drafts.append(parse_events(answer, a, b) or [(a, b, answer)])   # формат не соблюдён -> один общий период
+        if on_progress is not None:
+            on_progress(step / total, step, total)
     return drafts
 
 
-def review_events(llm, segments, chunks, drafts, language):
+def review_events(llm, segments, chunks, drafts, language, on_progress=None, stop_event=None):
     """Редактор идёт по сюжету подряд. Предыдущий кусок уже исправлен, следующий пока черновик."""
     checked = []
+    total = len(chunks)
     for i, (a, b) in enumerate(chunks):
-        print(f"Проверка: кусок {i + 1}/{len(chunks)}")
+        _check_stop(stop_event)
+        step = i + 1
+        print(f"Проверка: кусок {step}/{total}")
+        if on_progress is not None:
+            on_progress(i / total, step, total)
         before = plain_events(checked[-1]) if checked else "(none)"
         after = plain_events(drafts[i + 1]) if i + 1 < len(drafts) else "(none)"
         answer = ask(
@@ -326,6 +680,8 @@ def review_events(llm, segments, chunks, drafts, language):
             "Write the corrected events of the current part.",
             max_tokens=1800)
         checked.append(parse_events(answer, a, b) or drafts[i])         # ответ не разобрался -> оставляем черновик
+        if on_progress is not None:
+            on_progress(step / total, step, total)
     return checked
 
 
@@ -339,35 +695,92 @@ def same_scene(llm, first, second):
     return answer.upper().startswith("YES")
 
 
-def merge_across_chunks(llm, events_by_chunk, language):
+def merge_across_chunks(llm, events_by_chunk, language, on_progress=None, stop_event=None):
     merged = []
-    for chunk_events in events_by_chunk:
+    total = max(1, len(events_by_chunk) - 1)
+    for idx, chunk_events in enumerate(events_by_chunk):
+        _check_stop(stop_event)
         if not chunk_events:
             continue
-        if merged and same_scene(llm, merged[-1][2], chunk_events[0][2]):
-            first, _, text = merged[-1]
-            _, last, next_text = chunk_events[0]
-            merged[-1] = (first, last, f"{text} {next_text}")
-            merged.extend(chunk_events[1:])
+        if merged:
+            step = min(idx, total)
+            if on_progress is not None:
+                on_progress((step - 1) / total, step, total)
+            if same_scene(llm, merged[-1][2], chunk_events[0][2]):
+                first, _, text = merged[-1]
+                _, last, next_text = chunk_events[0]
+                merged[-1] = (first, last, f"{text} {next_text}")
+                merged.extend(chunk_events[1:])
+            else:
+                merged.extend(chunk_events)
+            if on_progress is not None:
+                on_progress(step / total, step, total)
         else:
             merged.extend(chunk_events)
     return merged
 
 
-def build_plot(segments, llm_loader, language, review=True):
+def build_plot(segments, llm_loader, language, review=True, on_progress=None, stop_event=None):
     chunks = split_chunks(segments, CHUNK_CHARS)
-    llm = llm_loader()                                        
+    _check_stop(stop_event)
+    _emit(on_progress, 0.0, None, "Сюжет: загрузка языковой модели...")
+    llm = llm_loader()
+    passes = 4 if review else 3
+    pass_span = 0.95 / passes
+
+    def make_pass_cb(pass_num, pass_title):
+        base = 0.02 + (pass_num - 1) * pass_span
+
+        def _cb(frac, step, total):
+            _emit(
+                on_progress,
+                base + frac * pass_span,
+                frac,
+                f"Сюжет ({pass_num}/{passes} • {pass_title}): кусок {step}/{total}",
+            )
+
+        return _cb
+
+    def _merge_cb(frac, step, total):
+        _emit(
+            on_progress,
+            0.97 + frac * 0.03,
+            frac,
+            f"Сюжет: склейка границ ({step}/{total})",
+        )
+
     try:
-        before = read_pass(llm, segments, chunks, language, backward=False)
-        after = read_pass(llm, segments, chunks, language, backward=True)
-        events = write_events(llm, segments, chunks, before, after, language)
+        before = read_pass(
+            llm, segments, chunks, language, backward=False,
+            on_progress=make_pass_cb(1, "Вперёд") if on_progress is not None else None,
+            stop_event=stop_event,
+        )
+        after = read_pass(
+            llm, segments, chunks, language, backward=True,
+            on_progress=make_pass_cb(2, "Назад") if on_progress is not None else None,
+            stop_event=stop_event,
+        )
+        events = write_events(
+            llm, segments, chunks, before, after, language,
+            on_progress=make_pass_cb(3, "События") if on_progress is not None else None,
+            stop_event=stop_event,
+        )
         if review:
-            events = review_events(llm, segments, chunks, events, language)
-        events = merge_across_chunks(llm, events, language)   
+            events = review_events(
+                llm, segments, chunks, events, language,
+                on_progress=make_pass_cb(4, "Проверка") if on_progress is not None else None,
+                stop_event=stop_event,
+            )
+        events = merge_across_chunks(
+            llm, events, language,
+            on_progress=_merge_cb if on_progress is not None else None,
+            stop_event=stop_event,
+        )
     finally:
         close_model(llm)
         del llm; free()
 
+    _emit(on_progress, 1.0, 1.0, "Сюжет готов")
     plot = [(segments[a]["start"], segments[b]["end"], text) for a, b, text in events]
     return sorted(plot, key=lambda e: e[0])
 
@@ -379,16 +792,40 @@ def write_plot(events, path):
             f.write(f"[{ts(start)[:8]} - {ts(end)[:8]}] {text}\n\n")
 
 def generate_subtitles(input_video, output_srt, output_plot=None, llm_loader=None,
-                       model_name="large-v3", language=None, batch_size=4, detect_sec=120,
-                       plot_language="Russian", review=True):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    workdir = Path("work") / Path(input_video).stem           
+                       model_name=None, language=None, batch_size=4, detect_sec=120,
+                       plot_language="Russian", review=True, stop_event=None,
+                       on_progress=None):
+    workdir = Path("work") / Path(input_video).stem
     workdir.mkdir(parents=True, exist_ok=True)
 
-    segments = get_segments(input_video, workdir, device, model_name, language, batch_size, detect_sec)
+    has_plot = llm_loader is not None and output_plot is not None
+    subs_span = 0.20 if has_plot else 1.0
+
+    def _subs_cb(stage_frac, step_frac, text):
+        _emit(on_progress, stage_frac * subs_span, step_frac, text)
+
+    model_file = model_name or WHISPER_MODEL_FILE
+    segments = get_segments(
+        input_video,
+        workdir,
+        model_file=model_file,
+        language=language,
+        stop_event=stop_event,
+        on_progress=_subs_cb if on_progress is not None else None,
+    )
     write_srt(segments, output_srt)
 
-    if llm_loader is not None and output_plot is not None:
-        events = build_plot(segments, llm_loader, plot_language, review)
+    if has_plot:
+        def _plot_cb(stage_frac, step_frac, text):
+            _emit(on_progress, 0.20 + stage_frac * 0.80, step_frac, text)
+
+        events = build_plot(
+            segments,
+            llm_loader,
+            plot_language,
+            review,
+            on_progress=_plot_cb if on_progress is not None else None,
+            stop_event=stop_event,
+        )
         write_plot(events, output_plot)
     return output_srt
