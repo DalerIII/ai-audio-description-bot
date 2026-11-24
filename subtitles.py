@@ -6,6 +6,7 @@ from huggingface_hub import hf_hub_download
 
 from config import (
     APP_DIR,
+    EXPERIMENTAL_EARLY_CAST,
     N_THREADS,
     WHISPER_DIR,
     WHISPER_REPO_ID,
@@ -18,9 +19,9 @@ from models import chat, close_model
 SR = 16000             
 
 CHUNK_CHARS = 4000       
-NOTE_SENTENCES = "5-8"   
+NOTE_SENTENCES = "4-7"   
 EVENT_SENTENCES = "3-6" 
-EVENT_COUNT = "1-3"      
+EVENT_COUNT = "1-2"      
 RECENT_NOTES = 3       
 MAX_FAR_CHARS = 2500     
 FAR_WORDS = 300          
@@ -447,63 +448,78 @@ def write_srt(segments, path):
 EVENT_FORMAT = (
     "Output one event per line in exactly this format:\n"
     "FIRST-LAST | description\n"
-    "where FIRST and LAST are the numbers of the first and last subtitle line of the event. "
-    "Events follow the order of the lines and do not overlap. "
-    "Output nothing except these lines."
+    "where FIRST and LAST are ONLY the integer subtitle line numbers (NOT timestamps) of the first and last "
+    "subtitle line of the event. Events follow the order of the lines and do not overlap. "
+    "Never repeat the same line range twice. Output nothing except these lines."
 )
 
 PASS_SYSTEM = (
-    "You are reading a movie's subtitles one part at a time. The subtitles have no speaker labels and no "
-    "scene descriptions: work out who speaks from the context, and use character names only if they "
-    "appear in the dialogue.\n"
+    "You are reading a movie's subtitles one part at a time. Each subtitle has a [HH:MM:SS] timestamp, and long "
+    "silences are marked, but there are no speaker labels: work out who speaks from context and time gaps, and use "
+    "character names only if supported by the dialogue or summary.\n"
     "You are given a summary of everything that happens {side} the current part. "
-    "Describe ONLY what happens in the current part. "
-    "Do not invent facts that the text does not support.\n"
-    "Spell character names exactly as they are spelled in the summary.\n"
+    "Describe ONLY what happens in the current part — NEVER repeat or copy events from the {side} summary.\n"
+    "Distinguish living human speakers from pets/animals or deceased figures (never assign dialogue to a pet or dead character).\n"
+    "Summarize the real events (conflict, decisions, location, phone call or flashback if clear) instead of "
+    "repetitive 'X asks, Y answers' stenography. Do not invent facts. "
+    "Spell character names consistently with the summary.\n"
     "Write in {language}."
 )
 
+CAST_SYSTEM = (
+    "From the finished plot of a movie, build a concise character list (at most 8 lines).\n"
+    "STRICT RULES:\n"
+    "- Include ONLY named people and named pets/animals that matter to the story.\n"
+    "- NEVER include places (bar, cafe, room), drinks/food, objects (TV, wand), or generic groups.\n"
+    "- Merge spelling variants of the same name (e.g. Ники/Никки -> one name).\n"
+    "- Verify roles carefully across the ENTIRE plot so you do not swap characters.\n"
+    "- For each entry, explicitly specify gender or animal/non-speaker type in parentheses in {language} "
+    "(e.g. мужчина / женщина / кошка, не человек — не говорит / только упоминается).\n"
+    "Output ONLY bullet lines in this exact format:\n"
+    "- Name (gender/type): brief role and relationships\n"
+    "Write in {language}. Output nothing else."
+)
+
 FINAL_SYSTEM = (
-    "You describe one part of a movie from its subtitles. The subtitles have no speaker labels and no "
-    "scene descriptions.\n"
-    "You are given summaries of what happens BEFORE and AFTER this part, so you know both the past and "
-    "the future of the story. Use them to understand who is who and what the lines refer to. "
-    "Describe ONLY what happens in the current part, in the order it happens.\n"
-    "Split the part into events. An event is a whole scene: one continuous conversation or situation "
-    "in one place with the same participants. Do NOT split one conversation into several small events. "
-    "A part usually contains {count} events; start a new one only when the scene, the place or the "
-    "participants really change.\n"
-    "Each event is {sentences} sentences. Be detailed inside the event: mention every important "
-    "decision and revelation, and what exactly was said or done. Do not skip details to save space.\n"
-    "Use character names only if they appear in the dialogue, and spell them exactly as in the summaries. "
-    "If something is unclear from the text, say that it is unclear instead of guessing.\n"
+    "You describe one part of a movie from its numbered subtitles (`N [HH:MM:SS]: text`). The subtitles have "
+    "timestamps and silence markers, so use long time gaps to spot scene/location/time jumps, even though there are "
+    "no speaker labels.\n"
+    "You are given summaries of what happens BEFORE and AFTER this part so you know who is who and what the lines refer to. "
+    "Describe ONLY what actually happens in the current part's subtitles — NEVER copy or repeat scenes from BEFORE/AFTER.\n"
+    "Split the part into whole scenes: one event is one continuous conversation or situation in one place with the same participants. "
+    "Do NOT split one conversation into small fragments; if the whole part is one scene, output 1 event "
+    "(usually {count} events per part; start a new one only when place, time, or participants clearly change).\n"
+    "Each event is {sentences} sentences. Summarize the substance (key decisions, revelations, objects, location, "
+    "phone call or flashback if clear) instead of mechanical 'X asks..., Y answers...' chains. "
+    "Clearly distinguish who is present in the scene vs who is only mentioned.\n"
+    "Use consistent character names from BEFORE/AFTER when context shows who is speaking; never assign "
+    "dialogue to pets/animals or deceased figures.\n"
     "Write the descriptions in {language}.\n\n"
 ) + EVENT_FORMAT
 
 REVIEW_SYSTEM = (
-    "You are an editor. You check a draft description of one part of a movie against its subtitles. "
-    "The subtitles have no speaker labels.\n"
-    "Go through the draft event by event:\n"
-    "- every fact must be supported by the subtitles; fix or remove facts that are wrong or invented;\n"
-    "- add important events from the subtitles that the draft missed;\n"
-    "- split an event only if it mixes different scenes or places; never split one continuous "
-    "conversation into small events, and merge neighbouring events that belong to the same scene;\n"
-    "- fix the line numbers so that each event covers exactly the lines where it happens;\n"
-    "- make character names and facts consistent with the neighbouring events;\n"
-    "- if something is unclear from the text, say that it is unclear instead of guessing.\n"
+    "You are an editor checking a draft description of one part of a movie against its numbered subtitles (`N [HH:MM:SS]: text`).\n"
+    "Go through the draft carefully:\n"
+    "- every fact must be directly supported by the current part's subtitles; delete invented facts, ASR garbage, "
+    "and any repeated/copied events that do not happen in these lines;\n"
+    "- fix speaker mistakes (especially pets/animals or deceased figures treated as speakers) and unify name spelling;\n"
+    "- merge neighbouring events that belong to the same continuous conversation or scene, and split where timestamps show a scene jump;\n"
+    "- rewrite mechanical 'X asks..., Y answers...' chains into a concise, natural scene summary;\n"
+    "- keep clear location, phone call / flashback cues, and distinguish participants from mentioned names;\n"
+    "- fix line numbers so each event covers its subtitle lines without duplicates.\n"
     "Output the full corrected list of events of the current part. "
     "Write the descriptions in {language}.\n\n"
 ) + EVENT_FORMAT
 
 COMPRESS_SYSTEM = (
-    "You shorten story summaries. Keep the main events in chronological order, the names, and the "
-    "cause-and-effect links. Drop minor details. Write in {language}."
+    "You shorten story summaries. Keep the main events in chronological order, consistent character names "
+    "(keeping clear who is human vs a pet/animal), and cause-and-effect links. Drop minor details. Write in {language}."
 )
 
 NO_PAST = "(this is the beginning of the film)"
 NO_FUTURE = "(this is the end of the film)"
 
-EVENT_RE = re.compile(r"^[^\w|]*(\d+)\s*(?:[-–—]\s*(\d+))?[^\w|]*\|\s*(.+)$")
+EVENT_RE = re.compile(r"^\s*[-*•]?\s*(\d+)(?!\s*:)\s*(?:[-–—]\s*(\d+)(?!\s*:))?\s*\|\s*(.+)$")
 
 def split_chunks(segments, max_chars):
     chunks, first, size = [], 0, 0
@@ -517,12 +533,27 @@ def split_chunks(segments, max_chars):
     return chunks
 
 
+def _format_sub_lines(segments, a, b, with_numbers: bool) -> str:
+    out = []
+    for i in range(a, b + 1):
+        if i > a:
+            gap = segments[i]["start"] - segments[i - 1]["end"]
+            if gap >= 15.0:
+                out.append(f"[... пауза {int(round(gap))} сек ...]")
+        stamp = ts(segments[i]["start"])[:8]
+        if with_numbers:
+            out.append(f"{i} [{stamp}]: {segments[i]['text']}")
+        else:
+            out.append(f"[{stamp}] {segments[i]['text']}")
+    return "\n".join(out)
+
+
 def plain_text(segments, a, b):
-    return "\n".join(segments[i]["text"] for i in range(a, b + 1))
+    return _format_sub_lines(segments, a, b, with_numbers=False)
 
 
 def numbered_text(segments, a, b):
-    return "\n".join(f"{i}: {segments[i]['text']}" for i in range(a, b + 1))
+    return _format_sub_lines(segments, a, b, with_numbers=True)
 
 
 def ask(llm, system, user, max_tokens):
@@ -539,10 +570,14 @@ def ask(llm, system, user, max_tokens):
 # События: разбор ответа модели и вывод обратно в текст
 # ---------------------------------------------------------------------------
 
+def _norm_event_text(text: str) -> str:
+    return " ".join(re.sub(r"\W+", " ", text.lower()).split())
+
+
 def parse_events(answer, first_line, last_line):
     """Ответ вида '12-18 | описание' -> [(первая реплика, последняя реплика, текст)].
-    Номера зажимаем в границы куска. Если ни одной строки не распознано, вернётся пустой список."""
-    events = []
+    Номера зажимаем в границы куска и отсекаем дубли при зацикливании модели."""
+    raw_events = []
     for line in answer.splitlines():
         line = line.strip()
         m = EVENT_RE.match(line)
@@ -552,10 +587,28 @@ def parse_events(answer, first_line, last_line):
             a, b = sorted((a, b))
             a = min(max(a, first_line), last_line)
             b = min(max(b, first_line), last_line)
-            events.append([a, b, m.group(3).strip()])
-        elif events and line:                                 # модель перенесла описание на новую строку
-            events[-1][2] += " " + line
-    return [tuple(e) for e in events]
+            raw_events.append([a, b, m.group(3).strip()])
+        elif raw_events and line:                             # модель перенесла описание на новую строку
+            raw_events[-1][2] += " " + line
+
+    deduped = []
+    for a, b, text in raw_events:
+        if not text:
+            continue
+        norm = _norm_event_text(text)
+        if not norm:
+            continue
+        if deduped:
+            pa, pb, ptext = deduped[-1]
+            pnorm = _norm_event_text(ptext)
+            if pnorm == norm or ((pa, pb) == (a, b) and (pnorm.startswith(norm) or norm.startswith(pnorm))):
+                if len(text) > len(ptext):
+                    deduped[-1] = (a, b, text)
+                continue
+        if any(_norm_event_text(et) == norm and (ea, eb) == (a, b) for ea, eb, et in deduped):
+            continue
+        deduped.append((a, b, text))
+    return deduped
 
 
 def format_events(events):
@@ -631,11 +684,77 @@ def read_pass(llm, segments, chunks, language, backward, on_progress=None, stop_
     return known
 
 
+def build_cast(llm, plot_events, language):
+    """Составляет компактный справочник персонажей (только имена людей и питомцев) по готовому сюжету."""
+    if not plot_events:
+        return ""
+    lines = [f"[{ts(s)[:8]} - {ts(e)[:8]}] {text}" for s, e, text in plot_events if text and text.strip()]
+    if not lines:
+        return ""
+    max_total_chars = 10000
+    full_text = "\n".join(lines)
+    if len(full_text) > max_total_chars:
+        per_line = max(120, max_total_chars // len(lines))
+        full_text = "\n".join(line[:per_line] for line in lines)
+    print("Справочник персонажей...")
+    raw = ask(
+        llm,
+        CAST_SYSTEM.format(language=language),
+        f"Finished movie plot:\n\n{full_text}\n\nList ONLY the main named characters and named pets/animals.",
+        max_tokens=500,
+    )
+    cleaned_lines = [
+        line.strip() for line in raw.splitlines()
+        if line.strip().startswith(("-", "*", "•")) and ":" in line
+    ]
+    return "\n".join(cleaned_lines[:8]) if cleaned_lines else raw.strip()
+
+
+# === [EXPERIMENTAL EARLY CAST — чисто экспериментальная часть, можно отключить через EXPERIMENTAL_EARLY_CAST или целиком удалить] ===
+def _experimental_build_early_cast(llm, chunks, before, after, language) -> str:
+    """Экспериментально собирает черновой справочник персонажей по итогам проходов 1-2
+    ДО разметки событий (проходы 3-4), чтобы модель сразу писала единые имена вместо 'два собеседника'."""
+    if not EXPERIMENTAL_EARLY_CAST or not chunks:
+        return ""
+    notes = []
+    if len(chunks) - 1 in before and before[len(chunks) - 1]:
+        notes.append(before[len(chunks) - 1])
+    if 0 in after and after[0]:
+        notes.append(after[0])
+    combined = "\n\n".join(notes).strip()
+    if not combined:
+        return ""
+    print("[эксперимент] Черновой справочник персонажей перед разметкой сцен...")
+    raw = ask(
+        llm,
+        CAST_SYSTEM.format(language=language),
+        f"Draft summaries of the film:\n\n{combined[:10000]}\n\n"
+        "List ONLY the main named characters and named pets/animals with unified spelling.",
+        max_tokens=500,
+    )
+    cleaned_lines = [
+        line.strip() for line in raw.splitlines()
+        if line.strip().startswith(("-", "*", "•")) and ":" in line
+    ]
+    return "\n".join(cleaned_lines[:8]) if cleaned_lines else ""
+
+
+def _with_experimental_cast(user_prompt: str, early_cast: str) -> str:
+    if not EXPERIMENTAL_EARLY_CAST or not early_cast:
+        return user_prompt
+    return (
+        f"Known characters of the film (experimental guide — unify name spelling and genders, "
+        f"use names instead of 'two speakers' when context makes clear who speaks):\n{early_cast}\n\n"
+        + user_prompt
+    )
+# === [/EXPERIMENTAL EARLY CAST] ===
+
+
 # ---------------------------------------------------------------------------
 # Проход 3: события с точными границами. Проход 4: проверка и правка
 # ---------------------------------------------------------------------------
 
-def write_events(llm, segments, chunks, before, after, language, on_progress=None, stop_event=None):
+def write_events(llm, segments, chunks, before, after, language, on_progress=None, stop_event=None, early_cast=""):
     drafts = []
     total = len(chunks)
     for i, (a, b) in enumerate(chunks):
@@ -644,21 +763,27 @@ def write_events(llm, segments, chunks, before, after, language, on_progress=Non
         print(f"События: кусок {step}/{total}")
         if on_progress is not None:
             on_progress(i / total, step, total)
-        answer = ask(
-            llm, FINAL_SYSTEM.format(language=language, sentences=EVENT_SENTENCES, count=EVENT_COUNT),
+        user_prompt = _with_experimental_cast(
             f"Summary of the film BEFORE this part:\n{before[i] or NO_PAST}\n\n"
             f"Summary of the film AFTER this part:\n{after[i] or NO_FUTURE}\n\n"
-            f"Subtitles of the current part (each line starts with its number):\n"
+            f"Subtitles of the current part (each line starts with its number and timestamp):\n"
             f"{numbered_text(segments, a, b)}\n\n"
             "Split the current part into events.",
-            max_tokens=1500)
-        drafts.append(parse_events(answer, a, b) or [(a, b, answer)])   # формат не соблюдён -> один общий период
+            early_cast,
+        )
+        answer = ask(
+            llm,
+            FINAL_SYSTEM.format(language=language, sentences=EVENT_SENTENCES, count=EVENT_COUNT),
+            user_prompt,
+            max_tokens=1500,
+        )
+        drafts.append(parse_events(answer, a, b) or [(a, b, " ".join(dict.fromkeys(l.strip() for l in answer.splitlines() if l.strip())))])
         if on_progress is not None:
             on_progress(step / total, step, total)
     return drafts
 
 
-def review_events(llm, segments, chunks, drafts, language, on_progress=None, stop_event=None):
+def review_events(llm, segments, chunks, drafts, language, on_progress=None, stop_event=None, early_cast=""):
     """Редактор идёт по сюжету подряд. Предыдущий кусок уже исправлен, следующий пока черновик."""
     checked = []
     total = len(chunks)
@@ -670,15 +795,21 @@ def review_events(llm, segments, chunks, drafts, language, on_progress=None, sto
             on_progress(i / total, step, total)
         before = plain_events(checked[-1]) if checked else "(none)"
         after = plain_events(drafts[i + 1]) if i + 1 < len(drafts) else "(none)"
-        answer = ask(
-            llm, REVIEW_SYSTEM.format(language=language),
+        user_prompt = _with_experimental_cast(
             f"Events before this part (already checked):\n{before}\n\n"
             f"Events after this part (draft):\n{after}\n\n"
-            f"Subtitles of the current part (each line starts with its number):\n"
+            f"Subtitles of the current part (each line starts with its number and timestamp):\n"
             f"{numbered_text(segments, a, b)}\n\n"
             f"Draft events of the current part:\n{format_events(drafts[i])}\n\n"
             "Write the corrected events of the current part.",
-            max_tokens=1800)
+            early_cast,
+        )
+        answer = ask(
+            llm,
+            REVIEW_SYSTEM.format(language=language),
+            user_prompt,
+            max_tokens=1800,
+        )
         checked.append(parse_events(answer, a, b) or drafts[i])         # ответ не разобрался -> оставляем черновик
         if on_progress is not None:
             on_progress(step / total, step, total)
@@ -692,7 +823,8 @@ def same_scene(llm, first, second):
         "the same place, the same conversation or situation, no jump in time. Answer YES or NO.",
         f"First description:\n{first}\n\nSecond description:\n{second}\n\nIs it the same scene?",
         max_tokens=4)
-    return answer.upper().startswith("YES")
+    up = answer.strip().upper()
+    return up.startswith("YES") or up.startswith("ДА")
 
 
 def merge_across_chunks(llm, events_by_chunk, language, on_progress=None, stop_event=None):
@@ -720,13 +852,13 @@ def merge_across_chunks(llm, events_by_chunk, language, on_progress=None, stop_e
     return merged
 
 
-def build_plot(segments, llm_loader, language, review=True, on_progress=None, stop_event=None):
+def build_plot(segments, llm_loader, language, review=True, on_progress=None, stop_event=None, return_cast=False):
     chunks = split_chunks(segments, CHUNK_CHARS)
     _check_stop(stop_event)
     _emit(on_progress, 0.0, None, "Сюжет: загрузка языковой модели...")
     llm = llm_loader()
     passes = 4 if review else 3
-    pass_span = 0.95 / passes
+    pass_span = 0.93 / passes
 
     def make_pass_cb(pass_num, pass_title):
         base = 0.02 + (pass_num - 1) * pass_span
@@ -744,11 +876,13 @@ def build_plot(segments, llm_loader, language, review=True, on_progress=None, st
     def _merge_cb(frac, step, total):
         _emit(
             on_progress,
-            0.97 + frac * 0.03,
+            0.95 + frac * 0.03,
             frac,
             f"Сюжет: склейка границ ({step}/{total})",
         )
 
+    cast = ""
+    sorted_plot = []
     try:
         before = read_pass(
             llm, segments, chunks, language, backward=False,
@@ -760,33 +894,48 @@ def build_plot(segments, llm_loader, language, review=True, on_progress=None, st
             on_progress=make_pass_cb(2, "Назад") if on_progress is not None else None,
             stop_event=stop_event,
         )
+        # === [EXPERIMENTAL EARLY CAST] ===
+        early_cast = _experimental_build_early_cast(llm, chunks, before, after, language)
+        # === [/EXPERIMENTAL EARLY CAST] ===
         events = write_events(
             llm, segments, chunks, before, after, language,
             on_progress=make_pass_cb(3, "События") if on_progress is not None else None,
             stop_event=stop_event,
+            early_cast=early_cast,
         )
         if review:
             events = review_events(
                 llm, segments, chunks, events, language,
                 on_progress=make_pass_cb(4, "Проверка") if on_progress is not None else None,
                 stop_event=stop_event,
+                early_cast=early_cast,
             )
         events = merge_across_chunks(
             llm, events, language,
             on_progress=_merge_cb if on_progress is not None else None,
             stop_event=stop_event,
         )
+        plot = [(segments[a]["start"], segments[b]["end"], text) for a, b, text in events]
+        sorted_plot = sorted(plot, key=lambda e: e[0])
+
+        _check_stop(stop_event)
+        _emit(on_progress, 0.98, None, "Сюжет: справочник персонажей...")
+        cast = build_cast(llm, sorted_plot, language)
     finally:
         close_model(llm)
         del llm; free()
 
     _emit(on_progress, 1.0, 1.0, "Сюжет готов")
-    plot = [(segments[a]["start"], segments[b]["end"], text) for a, b, text in events]
-    return sorted(plot, key=lambda e: e[0])
+    if return_cast:
+        return sorted_plot, cast
+    return sorted_plot
 
 
-def write_plot(events, path):
+def write_plot(events, path, cast=""):
     with open(path, "w", encoding="utf-8") as f:
+        if cast and cast.strip():
+            f.write("# Персонажи\n\n")
+            f.write(cast.strip() + "\n\n")
         f.write("# Сюжет\n\n")
         for start, end, text in events:
             f.write(f"[{ts(start)[:8]} - {ts(end)[:8]}] {text}\n\n")
@@ -819,13 +968,14 @@ def generate_subtitles(input_video, output_srt, output_plot=None, llm_loader=Non
         def _plot_cb(stage_frac, step_frac, text):
             _emit(on_progress, 0.20 + stage_frac * 0.80, step_frac, text)
 
-        events = build_plot(
+        events, cast = build_plot(
             segments,
             llm_loader,
             plot_language,
             review,
             on_progress=_plot_cb if on_progress is not None else None,
             stop_event=stop_event,
+            return_cast=True,
         )
-        write_plot(events, output_plot)
+        write_plot(events, output_plot, cast=cast)
     return output_srt

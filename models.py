@@ -1,5 +1,6 @@
 import os
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -127,7 +128,10 @@ def load_model(
         "-np", str(N_PARALLEL),
     ]
     if reasoning_budget is not None:
-        cmd += ["--reasoning-budget", str(reasoning_budget)]
+        if reasoning_budget == 0:
+            cmd += ["--reasoning", "off", "--reasoning-budget", "0"]
+        else:
+            cmd += ["--reasoning-budget", str(reasoning_budget)]
     if LOG_VERBOSITY is not None:
         cmd += ["-lv", str(LOG_VERBOSITY)]
     cmd += _extra_server_args()
@@ -163,7 +167,16 @@ def load_model(
         except requests.RequestException:
             pass
         time.sleep(1.0)
-    return {"proc": proc, "url": server_url, "session": session, "model_file": model_file, "on_stats": on_stats}
+    return {
+        "proc": proc,
+        "url": server_url,
+        "session": session,
+        "model_file": model_file,
+        "n_ctx": n_ctx,
+        "reasoning_budget": reasoning_budget,
+        "on_stats": on_stats,
+        "_image_tokens_cache": {},
+    }
 
 
 def close_model(llm) -> None:
@@ -225,14 +238,32 @@ def _print_speed_summary() -> None:
 
 # --- Общение с моделью через HTTP API llama-server ---
 
-def chat(llm: dict, messages: list, max_tokens: int = MAX_REPLY, temperature: float = 0.3) -> str:
-    # Отправляем OpenAI-совместимый запрос на генерацию ответа в /v1/chat/completions
-    for extra in (None, {"chat_template_kwargs": {"enable_thinking": False}}):
+def chat(
+    llm: dict,
+    messages: list,
+    max_tokens: int = MAX_REPLY,
+    temperature: float = 0.3,
+    repeat_penalty: float = 1.1,
+) -> str:
+    # max_tokens — лимит именно на итоговый ответ (content); бюджет на рассуждения (reasoning_budget)
+    # идёт отдельно поверх него, чтобы мысли модели не съедали лимит ответа в 1500 (или 4..600) токенов.
+    rb = llm.get("reasoning_budget", REASONING_BUDGET)
+    no_think_extra = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    if rb == 0:
+        attempts = ((max_tokens, no_think_extra), (max_tokens, None))
+    else:
+        think_allowance = rb if (rb is not None and rb > 0) else 2048
+        attempts = ((max_tokens + think_allowance, None), (max_tokens, no_think_extra))
+
+    for req_max_tokens, extra in attempts:
         payload = {
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": req_max_tokens,
             "temperature": temperature,
         }
+        if repeat_penalty is not None:
+            payload["repeat_penalty"] = repeat_penalty
         if extra:
             payload.update(extra)
         t0 = time.perf_counter()  # [SPEED STATS]
@@ -295,17 +326,67 @@ def count_prompt_tokens(llm: dict, messages: list) -> int:
     return r.json()["usage"]["prompt_tokens"]
 
 
-def count_image_tokens(llm: dict, data_url: str) -> int:
-    # Оцениваем стоимость одного кадра в токенах через пробный чат-запрос с изображением
-    return count_prompt_tokens(
+def _jpeg_size(path: str) -> tuple[int, int] | None:
+    try:
+        with open(path, "rb") as f:
+            if f.read(2) != b"\xff\xd8":
+                return None
+            while True:
+                b = f.read(1)
+                if not b:
+                    return None
+                if b != b"\xff":
+                    continue
+                while b == b"\xff":
+                    b = f.read(1)
+                if not b:
+                    return None
+                marker = b[0]
+                if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                    continue
+                seg_len_raw = f.read(2)
+                if len(seg_len_raw) < 2:
+                    return None
+                seg_len = struct.unpack(">H", seg_len_raw)[0]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    sof = f.read(5)
+                    if len(sof) < 5:
+                        return None
+                    h, w = struct.unpack(">HH", sof[1:5])
+                    return (w, h)
+                if seg_len < 2:
+                    return None
+                f.seek(seg_len - 2, os.SEEK_CUR)
+    except OSError:
+        return None
+
+
+def count_image_tokens(llm: dict, data_url: str, image_path: str | None = None) -> int:
+    # Кэшируем чистую стоимость одного кадра (без обвязки chat-шаблона) по разрешению кадра,
+    # чтобы не гонять визуальный энкодер вхолостую на каждой паузе.
+    cache = llm.setdefault("_image_tokens_cache", {})
+    cache_key = _jpeg_size(image_path) if image_path else None
+    if cache_key is None:
+        cache_key = ("len", len(data_url) // 4096)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    base_tokens = count_prompt_tokens(
+        llm,
+        [{"role": "user", "content": [{"type": "text", "text": "."}]}],
+    )
+    with_img_tokens = count_prompt_tokens(
         llm,
         [
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": "."},
+                    {"type": "text", "text": "."[:1]},
                 ],
             }
         ],
     )
+    img_tokens = max(32, with_img_tokens - base_tokens)
+    cache[cache_key] = img_tokens
+    return img_tokens

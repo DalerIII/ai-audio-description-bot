@@ -462,6 +462,13 @@ class App:
             self.check_stop()
 
             # Этап 3: описание и озвучка
+            for entry in os.scandir("voices"):
+                if entry.is_file() and entry.name.endswith((".mp3", ".tmp")):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass
+
             report(s3_load_range[0], None, "Этап 3/4 • Загрузка модели...")
             import asyncio
             from describe import describe_scene
@@ -474,16 +481,29 @@ class App:
                 indices = list(range(first, last + 1))
                 total = max(1, len(indices))
                 context = 0
+                border = max(0.0, float(s["border"]))
 
                 for n, i in enumerate(indices, start=1):
                     self.check_stop()
                     start = max(0.0, pauses[i][0].total_seconds())
                     end = pauses[i][1].total_seconds()
-                    words_num = int((end - start) * s["words_per_sec"])
+                    raw_dur = end - start
 
                     p_start = map_range(s3_pauses_range, (n - 1) / total)
                     p_end = map_range(s3_pauses_range, n / total)
                     p_span = p_end - p_start
+
+                    # Учитываем отступ border с обеих сторон паузы (от предыдущей и до следующей реплики)
+                    eff_border = min(border, max(0.0, (raw_dur - 1.0) / 2.0))
+                    voice_start = round(start + eff_border, 3)
+                    voice_end = round(end - eff_border, 3)
+                    voice_dur = voice_end - voice_start
+                    if voice_dur <= 0.2:
+                        self.post("log", f"[{n}/{total}] (пропуск — пауза слишком короткая для границы звука)")
+                        report(p_end, 100.0, f"Этап 3/4 • Пауза {n}/{total}: пропуск")
+                        continue
+
+                    words_num = max(2, int(voice_dur * s["words_per_sec"]))
 
                     def on_pause_progress(frac, text, _p_start=p_start, _p_span=p_span, _n=n, _total=total):
                         f = max(0.0, min(1.0, float(frac)))
@@ -498,11 +518,15 @@ class App:
                         kwargs["context"] = context
                     summary, context = describe_scene(llm, plot_path, sub_path, movie_path,
                                                       s["min_pause"], i, s["frame_step"], **kwargs)
+                    if not summary or not summary.strip():
+                        self.post("log", f"[{n}/{total}] (пропуск — нет значимых событий)")
+                        report(p_end, 100.0, f"Этап 3/4 • Пауза {n}/{total}: пропуск")
+                        continue
                     self.post("log", f"[{n}/{total}] {summary}")
 
                     report(p_start + p_span * 0.85, 85.0, f"Этап 3/4 • Пауза {n}/{total}: озвучка (TTS)...")
-                    asyncio.run(speak(summary, target_sec=end - start,
-                                      out=f"voices/voice_{start}_{end}.mp3"))
+                    asyncio.run(speak(summary, target_sec=voice_dur,
+                                      out=f"voices/voice_{voice_start}_{voice_end}.mp3"))
                     report(p_end, 100.0, f"Этап 3/4 • Пауза {n}/{total}: готово")
             finally:
                 close_model(llm)
