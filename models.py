@@ -1,3 +1,10 @@
+"""Управление локальной мультимодальной нейросетью (llama-server.exe).
+
+Модуль запускает llama-server в фоновом процессе, следит за его логами и скоростью,
+отправляет текстовые и картиночные запросы через OpenAI-совместимый HTTP API
+(/v1/chat/completions), а также считает токены текста и изображений.
+"""
+
 import os
 import re
 import struct
@@ -27,6 +34,7 @@ _PROMPT_PROGRESS_RE = re.compile(
 
 
 def _watch_server_output(proc: subprocess.Popen, on_stats=None) -> None:
+    """Читает stdout/stderr llama-server в отдельном потоке, пишет лог и шлёт прогресс чтения промпта в UI."""
     log_file = None
     frozen = getattr(sys, "frozen", False)
     if frozen:
@@ -93,6 +101,7 @@ def load_model(
     mmproj_file: str | None = MMPROJ_FILE,
     on_stats=None,
 ) -> dict:
+    """Скачивает GGUF-модель (и mmproj для зрения), запускает llama-server.exe и ждёт готовности /health."""
     if not LLAMA_SERVER_DIR:
         raise ValueError("Не указан путь LLAMA_SERVER_DIR в config.py (папка с llama-server.exe)")
     if not repo_id or not model_file:
@@ -180,6 +189,7 @@ def load_model(
 
 
 def close_model(llm) -> None:
+    """Аккуратно закрывает HTTP-сессию и останавливает процесс llama-server.exe."""
     if not llm:
         return
     _print_speed_summary()  # [SPEED STATS]
@@ -245,6 +255,7 @@ def chat(
     temperature: float = 0.3,
     repeat_penalty: float = 1.1,
 ) -> str:
+    """Отправляет диалог (текст и/или кадры) в llama-server и возвращает чистый ответ без тегов <think>."""
     # max_tokens — лимит именно на итоговый ответ (content); бюджет на рассуждения (reasoning_budget)
     # идёт отдельно поверх него, чтобы мысли модели не съедали лимит ответа в 1500 (или 4..600) токенов.
     rb = llm.get("reasoning_budget", REASONING_BUDGET)
@@ -327,6 +338,7 @@ def count_prompt_tokens(llm: dict, messages: list) -> int:
 
 
 def _jpeg_size(path: str) -> tuple[int, int] | None:
+    """Быстро читает ширину и высоту JPEG из заголовка файла без загрузки PIL/Pillow."""
     try:
         with open(path, "rb") as f:
             if f.read(2) != b"\xff\xd8":

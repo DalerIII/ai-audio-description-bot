@@ -30,32 +30,6 @@ def fmt_entry(e: PlotEntry) -> str:
     return f"[{fmt_time(e.start)} - {fmt_time(e.end)}] {e.text}"
 
 
-def parse_cast(path: str) -> list[str]:
-    cast: list[str] = []
-    in_cast = False
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    heading = line.lstrip("#").strip().lower()
-                    if heading.startswith("персонаж") or heading.startswith("действующие лица"):
-                        in_cast = True
-                        continue
-                    if in_cast:
-                        break
-                    continue
-                if in_cast:
-                    if LINE_RE.match(line):
-                        break
-                    cast.append(line)
-    except OSError:
-        return []
-    return cast
-
-
 def _norm_text(text: str) -> str:
     return " ".join(re.sub(r"\W+", " ", text.lower()).split())
 
@@ -160,45 +134,3 @@ def locate_plot(entries: list[PlotEntry], start: float, end: float):
 def split_plot(entries, start, end):
     past, now, future, _ = locate_plot(entries, start, end)
     return past, now, future
-
-
-_CAST_LINE_RE = re.compile(r"^\s*[-*•]?\s*([^:(]+?)(?:\s*\(([^)]*)\))?\s*:\s*(.+)$")
-_CASE_ENDINGS = r"(?:|а|я|у|ю|е|и|ы|ом|ем|ой|ей|ою|ею)"
-
-
-def _name_pattern(variant: str) -> re.Pattern | None:
-    v = variant.strip()
-    if len(v) < 2:
-        return None
-    # Отсекаем окончание для склонения по падежам, но оставляем корень не короче 3 букв
-    stem = v
-    if len(stem) >= 4 and stem[-1].lower() in "аяыиеуюь":
-        stem = stem[:-1]
-    first_char = re.escape(stem[0].upper())
-    rest = re.escape(stem[1:].lower())
-    # Имя собственное начинается с заглавной буквы + допустимые падежные окончания
-    return re.compile(rf"(?<!\w){first_char}(?:{rest}|(?i:{rest})){_CASE_ENDINGS}(?!\w)")
-
-
-def match_scene_cast(cast_lines: list[str], texts: list[str]) -> list[str]:
-    """Находит персонажей из справочника, которые упоминаются в текущем эпизоде сюжета или репликах."""
-    if not cast_lines or not texts:
-        return []
-    combined = "\n".join(t for t in texts if t)
-    if not combined.strip():
-        return []
-
-    matched = []
-    for line in cast_lines:
-        m = _CAST_LINE_RE.match(line)
-        if not m:
-            continue
-        names_raw = m.group(1).strip()
-        variants = [p.strip() for p in re.split(r"[/,]|или", names_raw) if p.strip()]
-        for var in variants:
-            # Берём каждое слово имени (например, имя или фамилию)
-            tokens = [w for w in var.split() if len(w) >= 2]
-            if any((pat := _name_pattern(tok)) is not None and pat.search(combined) for tok in tokens):
-                matched.append(line.lstrip("-*• ").strip())
-                break
-    return matched

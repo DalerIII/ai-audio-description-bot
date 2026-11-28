@@ -1,3 +1,14 @@
+"""Точка входа и графический интерфейс (Tkinter) приложения Tiflo.
+
+Отвечает за:
+- окно выбора фильма, языка комментариев, настроек и отображения прогресса/логов;
+- запуск всего 4-этапного пайплайна в фоновом потоке (чтобы интерфейс не зависал):
+  1) subtitles.py — субтитры (Whisper), диаризация (diarize.py) и сюжет;
+  2) slicing.py — поиск тихих пауз между репликами;
+  3) describe.py + voice.py — описание кадров VLM-моделью и озвучка через Piper TTS;
+  4) edit_video.py — приглушение оригинала и финальный монтаж видео.
+"""
+
 import os
 import sys
 import json
@@ -19,10 +30,14 @@ from config import (
     REPO_ID,
     MODEL_FILE,
     MMPROJ_FILE,
+    COMMENT_LANGUAGES,
+    DEFAULT_COMMENT_LANGUAGE,
+    normalize_comment_lang,
 )
 
 
 def _ensure_stdio():
+    """В собранном .exe без консоли перенаправляет print/ошибки в файл tiflo.log, чтобы программа не падала."""
     if sys.stdout is not None and sys.stderr is not None:
         return
     try:
@@ -55,6 +70,7 @@ DEFAULT_SETTINGS = {
     "border": 1.0,             # граница между монтированным и настоящим звуком
     "orig_volume": 0.3,        # громкость оригинального аудио
     "skip_subs": True,         # пропустить генерацию субтитров, если файлы уже есть
+    "comment_lang": DEFAULT_COMMENT_LANGUAGE,  # язык тифлокомментариев (ru / en / es)
     "n_ctx": N_CTX,
     "n_gpu_layers": N_GPU_LAYERS,
     "reasoning_budget": REASONING_BUDGET,
@@ -65,6 +81,7 @@ DEFAULT_SETTINGS = {
 
 
 def load_settings():
+    """Читает сохранённые настройки из settings.json поверх значений по умолчанию."""
     s = dict(DEFAULT_SETTINGS)
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -73,6 +90,7 @@ def load_settings():
         except Exception:
             pass
     s.pop("model_id", None)
+    s["comment_lang"] = normalize_comment_lang(s.get("comment_lang"))
     return s
 
 
@@ -96,6 +114,8 @@ class Stopped(Exception):
 
 
 class App:
+    """Главное окно программы: управляет UI, очередью сообщений из рабочего потока и запуском пайплайна."""
+
     def __init__(self, root):
         self.root = root
         root.title("Тифлокомментарии")
@@ -122,7 +142,7 @@ class App:
         ttk.Entry(top, textvariable=self.movie_var).pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(top, text="Выбрать...", command=self.choose_movie).pack(side="left")
 
-        # --- кнопки ---
+        # --- кнопки и выбор языка ---
         btns = ttk.Frame(root, padding=(10, 0))
         btns.pack(fill="x")
         self.start_btn = ttk.Button(btns, text="Старт", command=self.start)
@@ -130,6 +150,20 @@ class App:
         self.stop_btn = ttk.Button(btns, text="Стоп", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=5)
         ttk.Button(btns, text="Настройки", command=self.open_settings).pack(side="left")
+
+        self._lang_codes = list(COMMENT_LANGUAGES.keys())
+        self._lang_labels = [COMMENT_LANGUAGES[c] for c in self._lang_codes]
+        self.lang_var = tk.StringVar(value=COMMENT_LANGUAGES[self.settings["comment_lang"]])
+        self.lang_combo = ttk.Combobox(
+            btns,
+            textvariable=self.lang_var,
+            values=self._lang_labels,
+            state="readonly",
+            width=22,
+        )
+        self.lang_combo.pack(side="right")
+        self.lang_combo.bind("<<ComboboxSelected>>", self.on_language_change)
+        ttk.Label(btns, text="Язык комментариев:").pack(side="right", padx=(0, 6))
 
         # --- прогресс ---
         prog = ttk.Frame(root, padding=10)
@@ -167,6 +201,12 @@ class App:
         self.root.after(100, self.poll_queue)
 
     # ---------- UI ----------
+    def on_language_change(self, _event=None):
+        idx = self.lang_combo.current()
+        if 0 <= idx < len(self._lang_codes):
+            self.settings["comment_lang"] = self._lang_codes[idx]
+            save_settings(self.settings)
+
     def choose_movie(self):
         path = filedialog.askopenfilename(
             title="Выберите фильм",
@@ -284,6 +324,7 @@ class App:
         self.queue.put((kind, value))
 
     def poll_queue(self):
+        """Раз в 100 мс забирает обновления прогресса/логов из фонового потока и обновляет виджеты Tkinter."""
         try:
             while True:
                 kind, value = self.queue.get_nowait()
@@ -321,6 +362,7 @@ class App:
                     self._update_overall_info()
                     self.start_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
+                    self.lang_combo.configure(state="readonly")
                 elif kind == "error":
                     messagebox.showerror("Ошибка", value)
         except queue.Empty:
@@ -354,6 +396,7 @@ class App:
         self.tokens_var.set("")
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.lang_combo.configure(state="disabled")
         self.worker = threading.Thread(target=self.run_pipeline, args=(movie, dict(self.settings)),
                                        daemon=True)
         self.worker.start()
@@ -376,6 +419,7 @@ class App:
             raise Stopped()
 
     def run_pipeline(self, movie_path, s):
+        """Основной рабочий цикл обработки фильма (выполняется в отдельном потоке): этапы 1 -> 2 -> 3 -> 4."""
         try:
             from models import load_model, close_model
 
@@ -473,6 +517,8 @@ class App:
             import asyncio
             from describe import describe_scene
             from voice import speak
+            comment_lang = normalize_comment_lang(s.get("comment_lang"))
+            self.post("log", f"Язык комментариев: {COMMENT_LANGUAGES[comment_lang]}")
             llm = loader()
             report(s3_load_range[1], 100.0, "Этап 3/4 • Модель загружена")
             try:
@@ -513,7 +559,7 @@ class App:
                             f"Этап 3/4 • Пауза {_n}/{_total}: {text}",
                         )
 
-                    kwargs = dict(max_words=words_num, on_progress=on_pause_progress)
+                    kwargs = dict(max_words=words_num, on_progress=on_pause_progress, lang=comment_lang)
                     if context != 0:
                         kwargs["context"] = context
                     summary, context = describe_scene(llm, plot_path, sub_path, movie_path,
@@ -526,7 +572,8 @@ class App:
 
                     report(p_start + p_span * 0.85, 85.0, f"Этап 3/4 • Пауза {n}/{total}: озвучка (TTS)...")
                     asyncio.run(speak(summary, target_sec=voice_dur,
-                                      out=f"voices/voice_{voice_start}_{voice_end}.mp3"))
+                                      out=f"voices/voice_{voice_start}_{voice_end}.mp3",
+                                      lang=comment_lang))
                     report(p_end, 100.0, f"Этап 3/4 • Пауза {n}/{total}: готово")
             finally:
                 close_model(llm)
